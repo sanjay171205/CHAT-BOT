@@ -1,0 +1,86 @@
+import pandas as pd
+import numpy as np
+import nltk
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from transformers import BertTokenizer, BertForSequenceClassification
+import torch
+from sklearn.metrics import accuracy_score
+from flask import Flask, request, jsonify
+# Download NLTK resources
+nltk.download('punkt')
+nltk.download('stopwords')
+# Load dataset
+data = pd.read_csv('customer_support_data.csv')  # Replace with your dataset path
+# Preprocess the text data
+def preprocess_text(text):
+    stop_words = set(nltk.corpus.stopwords.words('english'))
+    words = nltk.word_tokenize(text.lower())  # Tokenize and convert to lowercase
+    return ' '.join([word for word in words if word not in stop_words and word.isalpha()])
+data['cleaned_text'] = data['query'].apply(preprocess_text)
+# Encode labels (for intent classification)
+label_encoder = LabelEncoder()
+data['encoded_intent'] = label_encoder.fit_transform(data['intent'])
+# Split data into training and test sets
+X_train, X_test, y_train, y_test = train_test_split(data['cleaned_text'], data['encoded_intent'], test_size=0.2, random_state=42)
+# Tokenize the text data using BERT tokenizer
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+def tokenize_data(texts):
+    return tokenizer(texts.tolist(), padding=True, truncation=True, return_tensors="pt", max_length=512)
+train_encodings = tokenize_data(X_train)
+test_encodings = tokenize_data(X_test)
+# Convert to PyTorch DataLoader format
+train_dataset = torch.utils.data.TensorDataset(train_encodings.input_ids, torch.tensor(y_train.values))
+test_dataset = torch.utils.data.TensorDataset(test_encodings.input_ids, torch.tensor(y_test.values))
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=16, shuffle=True)
+test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=16)
+# Initialize BERT model for sequence classification
+model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=len(label_encoder.classes_))
+# Define optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+# Training loop
+for epoch in range(3):  # Train for 3 epochs
+    model.train()
+    for batch in train_loader:
+        optimizer.zero_grad()
+        input_ids, labels = batch
+        outputs = model(input_ids, labels=labels)
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+        print(f"Epoch {epoch + 1}: Loss {loss.item()}")
+# Evaluate model performance
+model.eval()
+predictions = []
+with torch.no_grad():
+    for batch in test_loader:
+        input_ids, _ = batch
+        outputs = model(input_ids)
+        logits = outputs.logits
+        predictions.append(logits.argmax(dim=-1).cpu().numpy())
+
+# Convert predictions to a flat array
+predictions = np.concatenate(predictions)
+
+# Calculate accuracy
+print("BERT Model Performance")
+print("Accuracy:", accuracy_score(y_test, predictions))
+
+# Create Flask app for deployment
+app = Flask(__name__)
+
+# Define a function to predict intent using the trained BERT model
+def predict_intent(query):
+    inputs = tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+        predicted_class = logits.argmax(dim=-1).item()
+    return label_encoder.inverse_transform([predicted_class])[0]
+@app.route('/predict', methods=['POST'])
+def predict():
+    query = request.json['query']
+    intent = predict_intent(query)
+    return jsonify({"intent": intent})
+if __name__ == "__main__":
+    app.run(debug=True)
